@@ -67,7 +67,7 @@ X.402 Payment Protocol library for Arduino IoT devices. Enable pay-per-use funct
 #### PlatformIO
 ```ini
 lib_deps =
-    https://github.com/YOUR_USERNAME/tse-x-arduino-library.git
+    https://github.com/TSE-Sol/tse-x-arduino-library.git
 ```
 
 ### 2. Install Dependencies
@@ -331,6 +331,13 @@ MIT License - see [LICENSE](LICENSE) file
 
 ## Links
 
-- [TSE-X App](https://tse-x.app) - Mobile app for payments
+- [TSE-X Website](https://tse-sol.com/) - Official website
 - [Backend API](https://tse-x-backend.onrender.com) - Payment backend
-- [Documentation](docs/) - Additional documentation
+- [Discord](https://discord.gg/X9cTmzW2Gz) - Community support
+- [Twitter/X](https://x.com/T_S_E_Sol) - Updates
+
+## Support
+
+- 📧 Email: thesocialexperimentsol@gmail.com
+- 💬 Discord: [TSE-X Community](https://discord.gg/X9cTmzW2Gz)
+- 🐦 Twitter/X: [@T_S_E_Sol](https://x.com/T_S_E_Sol)
