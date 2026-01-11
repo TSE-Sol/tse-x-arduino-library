@@ -1,300 +1,651 @@
-/*
- * TSE-X Bike Lock Example
- * Arduino Nano 33 BLE / Arduino Nano ESP32
- * 
- * BLE-based bike lock controlled via mobile app bridge.
- * User pays in app, app sends unlock command via BLE.
- * 
- * Pricing: $0.50 for 30 minutes
- * 
- * Hardware:
- * - Arduino Nano 33 BLE or Nano ESP32
- * - Servo or solenoid lock on pin 9
- * - LED indicator on pin LED_BUILTIN
- * 
- * BLE Services:
- * - Lock Service UUID: b3c8f420-0000-4020-8000-000000000000
- * - Control Characteristic: b3c8f420-0002-4020-8000-000000000000
- * - Status Characteristic: b3c8f420-0003-4020-8000-000000000000
- * 
- * Flow:
- * 1. Arduino advertises as BLE device
- * 2. App connects after payment verified
- * 3. App sends unlock command via BLE
- * 4. Arduino unlocks and starts 30-min timer
- * 5. Timer expires or user ends session → lock engages
- */
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <ESP32Servo.h>
+#include <LiquidCrystal.h>
+#include <ArduinoJson.h>
 
-#include <ArduinoBLE.h>
-#include <TSE_X402.h>
+// ==================== DEVICE CONFIG ====================
+#define DEVICE_ID        "YOUR_DEVICE_ID"
+#define DEVICE_NAME      "YOUR_DEVICE_NAME"
+#define DEVICE_TYPE      "Bike Lock"
+#define DEVICE_MODEL     "BL-100"
+#define FIRMWARE_VERSION "1.1.0"  // Updated for restore feature
 
-// ============ CONFIGURATION ============
-const char* DEVICE_ID = "BIKE-LOCK-001";
+// Wallet addresses for payments (must match backend server.js)
+#define SOLANA_WALLET    "YOUR_SOLANA_WALLET_ADDRESS"
+#define BASE_WALLET      "YOUR_BASE_WALLET_ADDRESS"
 
-// ============ HARDWARE PINS ============
-const int LOCK_PIN = 9;         // Servo/solenoid control
-const int STATUS_LED = LED_BUILTIN;
+// ==================== BLE UUIDs ====================
+#define SERVICE_UUID           "b3c8f420-0000-4020-8000-000000000000"
+#define DEVICE_INFO_UUID       "b3c8f420-0001-4020-8000-000000000000"
+#define LOCK_CONTROL_UUID      "b3c8f420-0002-4020-8000-000000000000"
+#define SESSION_STATUS_UUID    "b3c8f420-0003-4020-8000-000000000000"
 
-// ============ BLE UUIDs ============
-#define LOCK_SERVICE_UUID        "b3c8f420-0000-4020-8000-000000000000"
-#define LOCK_CONTROL_UUID        "b3c8f420-0002-4020-8000-000000000000"
-#define LOCK_STATUS_UUID         "b3c8f420-0003-4020-8000-000000000000"
+// ==================== HARDWARE PINS ====================
+const int servoPin    = D13;
+const int buzzerPin   = D12;
+const int redLedPin   = D2;
+const int greenLedPin = D4;
 
-// ============ TIMING ============
-const unsigned long SESSION_DURATION_MS = 30 * 60 * 1000;  // 30 minutes
-const unsigned long HEARTBEAT_INTERVAL = 10000;  // 10 sec heartbeat
+// ==================== LCD (Parallel) ====================
+// LiquidCrystal(RS, E, D4, D5, D6, D7)
+LiquidCrystal lcd(D5, D6, D7, D8, D9, D10);
 
-// ============ STATE ============
-bool isLocked = true;
-bool sessionActive = false;
-unsigned long sessionEndTime = 0;
-unsigned long lastHeartbeat = 0;
+// ==================== OBJECTS ====================
+Servo lockServo;
 
-String sessionWallet = "";
-String sessionCurrency = "";
-String sessionTxHash = "";
+BLEServer* pServer = nullptr;
+BLECharacteristic* pDeviceInfoChar = nullptr;
+BLECharacteristic* pLockControlChar = nullptr;
+BLECharacteristic* pSessionStatusChar = nullptr;
 
-// BLE
-BLEService lockService(LOCK_SERVICE_UUID);
-BLECharacteristic controlChar(LOCK_CONTROL_UUID, BLEWrite | BLEWriteWithoutResponse, 256);
-BLECharacteristic statusChar(LOCK_STATUS_UUID, BLERead | BLENotify, 256);
+// ==================== STATE ====================
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+bool isUnlocked = false;
 
-char timeBuffer[16];
+// Session timing
+unsigned long sessionDurationMs = 0;
+unsigned long sessionStartMillis = 0;
+long lastDisplaySeconds = -1;
+String currentTxHash = "";
+String payerWallet = "";
+String paymentCurrency = "";
 
-// ============ SETUP ============
-void setup() {
-  Serial.begin(115200);
-  delay(2000);
-  
-  Serial.println("\n========================================");
-  Serial.println("   TSE-X Bike Lock (BLE)");
-  Serial.println("   " TSE_X402_VERSION);
-  Serial.println("========================================");
-  Serial.print("Device: ");
-  Serial.println(DEVICE_ID);
-  Serial.println("Price: $0.50 for 30 minutes");
-  Serial.println("Accepts: TSE (Solana) & USDC (Base)");
-  Serial.println();
-  
-  // Initialize pins
-  pinMode(LOCK_PIN, OUTPUT);
-  pinMode(STATUS_LED, OUTPUT);
-  
-  // Start locked
-  engageLock();
-  
-  // Initialize BLE
-  if (!BLE.begin()) {
-    Serial.println("❌ BLE init failed!");
-    while (1) {
-      digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
-      delay(100);
-    }
-  }
-  
-  // Setup BLE service
-  BLE.setLocalName(DEVICE_ID);
-  BLE.setDeviceName(DEVICE_ID);
-  BLE.setAdvertisedService(lockService);
-  
-  lockService.addCharacteristic(controlChar);
-  lockService.addCharacteristic(statusChar);
-  BLE.addService(lockService);
-  
-  // Set initial status
-  updateBLEStatus();
-  
-  // Start advertising
-  BLE.advertise();
-  
-  Serial.println("🔒 Lock engaged");
-  Serial.println("📡 BLE advertising...");
-  Serial.println("   Waiting for app connection");
-}
-
-// ============ MAIN LOOP ============
-void loop() {
-  unsigned long now = millis();
-  
-  // Poll BLE
-  BLE.poll();
-  
-  // Check for BLE commands
-  if (controlChar.written()) {
-    handleBLECommand();
-  }
-  
-  // Check session timeout
-  if (sessionActive && sessionEndTime > 0 && now >= sessionEndTime) {
-    Serial.println("\n⏰ Session expired!");
-    endSession();
-  }
-  
-  // Send heartbeat status
-  if (now - lastHeartbeat >= HEARTBEAT_INTERVAL) {
-    lastHeartbeat = now;
-    updateBLEStatus();
-    
-    if (sessionActive) {
-      unsigned long remaining = (sessionEndTime > now) ? (sessionEndTime - now) / 1000 : 0;
-      Serial.print("🔓 Unlocked - ");
-      Serial.print(TSE_FormatTime(remaining, timeBuffer));
-      Serial.println(" remaining");
-    }
-  }
-  
-  // Status LED
-  updateStatusLED(now);
-  
-  delay(10);
-}
-
-// ============ BLE COMMAND HANDLER ============
-void handleBLECommand() {
-  int len = controlChar.valueLength();
-  if (len == 0) return;
-  
-  char cmdBuffer[257];
-  memcpy(cmdBuffer, controlChar.value(), len);
-  cmdBuffer[len] = '\0';
-  
-  Serial.print("📥 BLE command: ");
-  Serial.println(cmdBuffer);
-  
-  // Parse JSON command
-  // Expected: {"action":"unlock","wallet":"...","currency":"TSE","txHash":"..."}
-  
-  if (strstr(cmdBuffer, "\"action\":\"unlock\"") != nullptr) {
-    // Extract wallet
-    const char* walletStart = strstr(cmdBuffer, "\"wallet\":\"");
-    if (walletStart) {
-      walletStart += 10;
-      const char* walletEnd = strchr(walletStart, '"');
-      if (walletEnd) {
-        sessionWallet = String(walletStart).substring(0, walletEnd - walletStart);
-      }
-    }
-    
-    // Extract currency
-    if (strstr(cmdBuffer, "\"currency\":\"USDC\"") != nullptr) {
-      sessionCurrency = "USDC (Base)";
-    } else {
-      sessionCurrency = "TSE (Solana)";
-    }
-    
-    // Extract txHash
-    const char* txStart = strstr(cmdBuffer, "\"txHash\":\"");
-    if (txStart) {
-      txStart += 10;
-      const char* txEnd = strchr(txStart, '"');
-      if (txEnd) {
-        sessionTxHash = String(txStart).substring(0, txEnd - txStart);
-      }
-    }
-    
-    startSession();
-    
-  } else if (strstr(cmdBuffer, "\"action\":\"lock\"") != nullptr) {
-    Serial.println("🔒 Lock command received");
-    endSession();
-    
-  } else if (strstr(cmdBuffer, "\"action\":\"status\"") != nullptr) {
-    updateBLEStatus();
-    
-  } else if (strstr(cmdBuffer, "\"action\":\"restore\"") != nullptr) {
-    // Restore existing session
-    const char* remainingStart = strstr(cmdBuffer, "\"remainingMs\":");
-    if (remainingStart) {
-      remainingStart += 14;
-      unsigned long remainingMs = atol(remainingStart);
-      
-      if (remainingMs > 0) {
-        sessionEndTime = millis() + remainingMs;
-        sessionActive = true;
-        releaseLock();
-        
-        Serial.println("🔄 Session restored!");
-        Serial.print("   Remaining: ");
-        Serial.println(TSE_FormatTime(remainingMs / 1000, timeBuffer));
-      }
-    }
+// ==================== BUZZER FUNCTIONS ====================
+void playBeep(int freq, int durationMs) {
+  int periodMicros = 1000000 / freq;
+  int cycles = (freq * durationMs) / 1000;
+  for (int i = 0; i < cycles; i++) {
+    digitalWrite(buzzerPin, HIGH);
+    delayMicroseconds(periodMicros / 2);
+    digitalWrite(buzzerPin, LOW);
+    delayMicroseconds(periodMicros / 2);
   }
 }
 
-// ============ SESSION MANAGEMENT ============
-void startSession() {
-  Serial.println("\n✅ UNLOCKING!");
-  Serial.print("   Paid with: ");
-  Serial.println(sessionCurrency);
+void playUnlockSound() {
+  playBeep(1000, 100);
+  delay(50);
+  playBeep(1200, 100);
+  delay(50);
+  playBeep(1400, 150);
+}
+
+void playLockSound() {
+  playBeep(800, 150);
+  delay(100);
+  playBeep(600, 200);
+}
+
+void playWarningSound() {
+  for (int i = 0; i < 3; i++) {
+    playBeep(1000, 100);
+    delay(100);
+  }
+}
+
+void playErrorSound() {
+  playBeep(400, 300);
+  delay(100);
+  playBeep(300, 300);
+}
+
+void playSuccessSound() {
+  playBeep(1000, 100);
+  delay(50);
+  playBeep(1500, 150);
+}
+
+// ============ NEW: Restore sound (distinct from unlock) ============
+void playRestoreSound() {
+  playBeep(800, 80);
+  delay(40);
+  playBeep(1000, 80);
+  delay(40);
+  playBeep(1200, 80);
+  delay(40);
+  playBeep(1400, 120);
+}
+
+// ==================== LOCK CONTROL ====================
+void setLocked(bool locked) {
+  if (locked) {
+    Serial.println("🔒 LOCKING...");
+    
+    digitalWrite(redLedPin, HIGH);
+    digitalWrite(greenLedPin, LOW);
+    
+    playLockSound();
+    
+    lockServo.write(0);
+    isUnlocked = false;
+    
+    sessionDurationMs = 0;
+    sessionStartMillis = 0;
+    currentTxHash = "";
+    payerWallet = "";
+    paymentCurrency = "";
+    lastDisplaySeconds = -1;
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("LOCKED");
+    lcd.setCursor(0, 1);
+    lcd.print("Scan to unlock");
+    
+    updateSessionStatus();
+    
+  } else {
+    Serial.println("🔓 UNLOCKING...");
+    
+    digitalWrite(redLedPin, LOW);
+    digitalWrite(greenLedPin, HIGH);
+    
+    playUnlockSound();
+    
+    lockServo.write(90);
+    isUnlocked = true;
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("UNLOCKED");
+    lcd.setCursor(0, 1);
+    lcd.print("Time: --:--");
+  }
+}
+
+// ============ NEW: setUnlockedQuiet - for restore (no sound, just state) ============
+void setUnlockedQuiet() {
+  Serial.println("🔓 UNLOCKING (quiet - restore)...");
+  
+  digitalWrite(redLedPin, LOW);
+  digitalWrite(greenLedPin, HIGH);
+  
+  lockServo.write(90);
+  isUnlocked = true;
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("SESSION RESTORED");
+  lcd.setCursor(0, 1);
+  lcd.print("Time: --:--");
+}
+
+void startSession(unsigned long durationMs, String txHash, String wallet, String currency) {
+  Serial.println("▶️ ============ STARTING SESSION ============");
+  Serial.print("   Duration: ");
+  Serial.print(durationMs / 1000);
+  Serial.println(" seconds");
+  Serial.print("   TxHash: ");
+  Serial.println(txHash);
   Serial.print("   Wallet: ");
-  Serial.println(sessionWallet.substring(0, 8) + "...");
+  Serial.println(wallet);
+  Serial.print("   Currency: ");
+  Serial.println(currency);
   
-  sessionActive = true;
-  sessionEndTime = millis() + SESSION_DURATION_MS;
+  sessionDurationMs = durationMs;
+  sessionStartMillis = millis();
+  currentTxHash = txHash;
+  payerWallet = wallet;
+  paymentCurrency = currency;
+  lastDisplaySeconds = -1;
   
-  releaseLock();
-  updateBLEStatus();
+  setLocked(false);
+  Serial.println("▶️ Session started successfully!");
+}
+
+// ============ NEW: Restore session from backend (after power loss) ============
+void restoreSession(unsigned long remainingMs, String wallet, String currency, String txHash) {
+  Serial.println("🔄 ============ RESTORING SESSION ============");
+  Serial.print("   Remaining: ");
+  Serial.print(remainingMs / 1000);
+  Serial.println(" seconds");
+  Serial.print("   Wallet: ");
+  Serial.println(wallet);
+  Serial.print("   Currency: ");
+  Serial.println(currency);
+  Serial.print("   TxHash: ");
+  Serial.println(txHash);
   
-  Serial.println("🔓 Lock released - 30 minute session started");
+  // Set session state
+  sessionDurationMs = remainingMs;  // Only the remaining time
+  sessionStartMillis = millis();     // Start counting from now
+  currentTxHash = txHash.length() > 0 ? txHash : "restored";
+  payerWallet = wallet;
+  paymentCurrency = currency;
+  lastDisplaySeconds = -1;
+  
+  // Unlock quietly (no fanfare since this is a restore)
+  setUnlockedQuiet();
+  
+  // Play restore sound (different from unlock)
+  playRestoreSound();
+  
+  // Update display after short delay
+  delay(1000);
+  lcd.setCursor(0, 0);
+  lcd.print("UNLOCKED        ");
+  
+  updateSessionStatus();
+  Serial.println("🔄 Session restored successfully!");
 }
 
 void endSession() {
-  sessionActive = false;
-  sessionEndTime = 0;
-  sessionWallet = "";
-  sessionCurrency = "";
-  sessionTxHash = "";
-  
-  engageLock();
-  updateBLEStatus();
-  
-  Serial.println("🔒 Lock engaged - session ended");
-  Serial.println("   Ready for next customer");
+  Serial.println("⏹️ ============ ENDING SESSION ============");
+  Serial.print("   Was unlocked: ");
+  Serial.println(isUnlocked ? "YES" : "NO");
+  setLocked(true);
+  Serial.println("⏹️ Session ended!");
 }
 
-// ============ LOCK CONTROL ============
-void engageLock() {
-  digitalWrite(LOCK_PIN, LOW);  // Adjust based on your lock type
-  isLocked = true;
-}
-
-void releaseLock() {
-  digitalWrite(LOCK_PIN, HIGH);  // Adjust based on your lock type
-  isLocked = false;
-}
-
-// ============ BLE STATUS ============
-void updateBLEStatus() {
-  char status[256];
-  unsigned long remaining = 0;
+void extendSession(unsigned long extraMs, String txHash) {
+  if (!isUnlocked) return;
   
-  if (sessionActive && sessionEndTime > millis()) {
-    remaining = (sessionEndTime - millis()) / 1000;
+  sessionDurationMs += extraMs;
+  currentTxHash = txHash;
+  
+  lcd.setCursor(0, 0);
+  lcd.print("TIME EXTENDED!  ");
+  playSuccessSound();
+  delay(1000);
+  lcd.setCursor(0, 0);
+  lcd.print("UNLOCKED        ");
+  
+  updateSessionStatus();
+}
+
+// ==================== SESSION STATUS ====================
+void updateSessionStatus() {
+  if (pSessionStatusChar == nullptr) return;
+  
+  StaticJsonDocument<512> doc;
+  
+  doc["deviceId"] = DEVICE_ID;
+  doc["state"] = isUnlocked ? "unlocked" : "locked";
+  
+  if (isUnlocked && sessionDurationMs > 0) {
+    unsigned long elapsed = millis() - sessionStartMillis;
+    unsigned long remaining = (elapsed >= sessionDurationMs) ? 0 : (sessionDurationMs - elapsed);
+    
+    doc["sessionActive"] = true;
+    doc["remainingMs"] = remaining;
+    doc["totalDurationMs"] = sessionDurationMs;
+    doc["elapsedMs"] = elapsed;
+    doc["txHash"] = currentTxHash;
+    doc["payerWallet"] = payerWallet;
+    doc["currency"] = paymentCurrency;
+  } else {
+    doc["sessionActive"] = false;
+    doc["remainingMs"] = 0;
   }
   
-  snprintf(status, sizeof(status),
-    "{\"locked\":%s,\"sessionActive\":%s,\"remainingSeconds\":%lu,\"deviceId\":\"%s\"}",
-    isLocked ? "true" : "false",
-    sessionActive ? "true" : "false",
-    remaining,
-    DEVICE_ID
-  );
+  String output;
+  serializeJson(doc, output);
   
-  statusChar.writeValue(status);
+  pSessionStatusChar->setValue(output.c_str());
+  
+  // DISABLED: Don't send notifications - app manages state locally
+  // Notifications were causing race conditions with app state
+  // if (deviceConnected) {
+  //   pSessionStatusChar->notify();
+  // }
 }
 
-// ============ STATUS LED ============
-void updateStatusLED(unsigned long now) {
-  static unsigned long lastBlink = 0;
+// ==================== LCD COUNTDOWN ====================
+void updateCountdownDisplay() {
+  if (!isUnlocked || sessionDurationMs == 0) return;
   
-  if (sessionActive) {
-    // Solid on when unlocked
-    digitalWrite(STATUS_LED, HIGH);
-  } else {
-    // Slow blink when locked
-    if (now - lastBlink >= 1000) {
-      lastBlink = now;
-      digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
+  unsigned long now = millis();
+  unsigned long elapsed = now - sessionStartMillis;
+  
+  if (elapsed >= sessionDurationMs) {
+    Serial.println("⏰ Session timer expired!");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("TIME'S UP!");
+    lcd.setCursor(0, 1);
+    lcd.print("Locking...");
+    delay(2000);
+    endSession();
+    return;
+  }
+  
+  unsigned long remaining = sessionDurationMs - elapsed;
+  unsigned long totalSeconds = remaining / 1000;
+  
+  if (totalSeconds == 60 && lastDisplaySeconds != 60) {
+    playWarningSound();
+    lcd.setCursor(0, 0);
+    lcd.print("1 MIN LEFT!     ");
+  }
+  
+  if (totalSeconds == 30 && lastDisplaySeconds != 30) {
+    playWarningSound();
+    lcd.setCursor(0, 0);
+    lcd.print("30 SEC LEFT!    ");
+  }
+  
+  if (totalSeconds <= 10 && totalSeconds > 0 && (long)totalSeconds != lastDisplaySeconds) {
+    playBeep(1000, 50);
+    lcd.setCursor(0, 0);
+    lcd.print("ENDING SOON!    ");
+  }
+  
+  if ((long)totalSeconds == lastDisplaySeconds) return;
+  lastDisplaySeconds = totalSeconds;
+  
+  unsigned int minutes = totalSeconds / 60;
+  unsigned int seconds = totalSeconds % 60;
+  
+  char buf[17];
+  snprintf(buf, sizeof(buf), "Time: %02u:%02u", minutes, seconds);
+  
+  lcd.setCursor(0, 1);
+  lcd.print(buf);
+  lcd.print("     ");
+}
+
+// ==================== BLE CALLBACKS ====================
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    Serial.println("📱 Phone connected via BLE");
+    
+    // Update session status so app can read current state
+    updateSessionStatus();
+    Serial.print("   Session active: ");
+    Serial.println(isUnlocked ? "YES" : "NO");
+    if (isUnlocked && sessionDurationMs > 0) {
+      unsigned long elapsed = millis() - sessionStartMillis;
+      unsigned long remaining = (elapsed >= sessionDurationMs) ? 0 : (sessionDurationMs - elapsed);
+      Serial.print("   Time remaining: ");
+      Serial.print(remaining / 1000);
+      Serial.println(" seconds");
+    }
+    
+    playBeep(1200, 100);
+    
+    if (!isUnlocked) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("App Connected");
+      lcd.setCursor(0, 1);
+      lcd.print("Ready to pay");
     }
   }
+  
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    Serial.println("📱 ============ BLE DISCONNECTED ============");
+    Serial.print("   Session active: ");
+    Serial.println(isUnlocked ? "YES" : "NO");
+    Serial.println("   NOT locking - session continues!");
+    
+    if (!isUnlocked) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("LOCKED");
+      lcd.setCursor(0, 1);
+      lcd.print("Scan to unlock");
+    } else {
+      Serial.println("   Timer still running...");
+    }
+  }
+};
+
+class LockControlCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) {
+    String value = pCharacteristic->getValue().c_str();
+    Serial.print("📥 Received command: ");
+    Serial.println(value);
+    
+    StaticJsonDocument<512> doc;
+    DeserializationError error = deserializeJson(doc, value);
+    
+    if (error) {
+      Serial.print("❌ JSON parse error: ");
+      Serial.println(error.c_str());
+      playErrorSound();
+      return;
+    }
+    
+    String action = doc["action"] | "";
+    
+    if (action == "unlock") {
+      String txHash = doc["txHash"] | "";
+      String wallet = doc["wallet"] | "";
+      String currency = doc["currency"] | "TSE";
+      unsigned long duration = doc["durationMs"] | 1800000;
+      
+      if (txHash.length() > 0) {
+        Serial.println("✅ Payment verified, unlocking...");
+        startSession(duration, txHash, wallet, currency);
+      } else {
+        Serial.println("❌ No transaction hash");
+        playErrorSound();
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Payment Error");
+        lcd.setCursor(0, 1);
+        lcd.print("No TX hash");
+        delay(2000);
+        if (!isUnlocked) {
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("LOCKED");
+          lcd.setCursor(0, 1);
+          lcd.print("Try again");
+        }
+      }
+    }
+    // ============ NEW: RESTORE ACTION ============
+    else if (action == "restore") {
+      // Restore session from backend after power loss
+      String wallet = doc["wallet"] | "";
+      String currency = doc["currency"] | "TSE";
+      String txHash = doc["txHash"] | "restored";
+      unsigned long remainingMs = doc["remainingMs"] | 0;
+      
+      Serial.println("🔄 ============ RESTORE COMMAND RECEIVED ============");
+      Serial.print("   Wallet: ");
+      Serial.println(wallet);
+      Serial.print("   Remaining: ");
+      Serial.print(remainingMs / 1000);
+      Serial.println(" seconds");
+      
+      if (remainingMs > 0 && wallet.length() > 0) {
+        // Verify we're not already in a session
+        if (isUnlocked) {
+          Serial.println("⚠️ Already unlocked - ignoring restore");
+          playErrorSound();
+          return;
+        }
+        
+        restoreSession(remainingMs, wallet, currency, txHash);
+      } else {
+        Serial.println("❌ Invalid restore params");
+        playErrorSound();
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Restore Failed");
+        lcd.setCursor(0, 1);
+        lcd.print("Invalid data");
+        delay(2000);
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("LOCKED");
+        lcd.setCursor(0, 1);
+        lcd.print("Scan to unlock");
+      }
+    }
+    else if (action == "lock" || action == "end") {
+      Serial.println("🔒 ============ LOCK COMMAND RECEIVED ============");
+      Serial.print("   Currently unlocked: ");
+      Serial.println(isUnlocked ? "YES" : "NO");
+      if (isUnlocked) {
+        Serial.println("   Processing lock request...");
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("Session Ended");
+        lcd.setCursor(0, 1);
+        lcd.print("Thank you!");
+        delay(1500);
+        endSession();
+      } else {
+        Serial.println("   Already locked, ignoring.");
+      }
+    }
+    else if (action == "extend") {
+      unsigned long extraMs = doc["extraMs"] | 0;
+      String txHash = doc["txHash"] | "";
+      
+      if (isUnlocked && extraMs > 0 && txHash.length() > 0) {
+        extendSession(extraMs, txHash);
+      } else {
+        playErrorSound();
+      }
+    }
+    else if (action == "status") {
+      updateSessionStatus();
+    }
+  }
+};
+
+// ==================== BUILD DEVICE INFO ====================
+String buildDeviceInfoJson() {
+  StaticJsonDocument<1024> doc;
+  
+  doc["deviceId"] = DEVICE_ID;
+  doc["deviceName"] = DEVICE_NAME;
+  doc["deviceType"] = DEVICE_TYPE;
+  doc["model"] = DEVICE_MODEL;
+  doc["firmwareVersion"] = FIRMWARE_VERSION;
+  
+  doc["supportsLock"] = true;
+  doc["supportsTimer"] = true;
+  doc["supportsBLE"] = true;
+  doc["supportsNFC"] = false;
+  doc["supportsPayment"] = true;
+  doc["supportsTSE"] = true;
+  doc["supportsUSDC"] = true;
+  doc["supportsRestore"] = true;  // NEW: Advertise restore capability
+  
+  JsonArray chains = doc.createNestedArray("chains");
+  
+  JsonObject solana = chains.createNestedObject();
+  solana["chain"] = "solana";
+  solana["wallet"] = SOLANA_WALLET;
+  
+  JsonObject base = chains.createNestedObject();
+  base["chain"] = "base";
+  base["wallet"] = BASE_WALLET;
+  
+  doc["state"] = isUnlocked ? "unlocked" : "locked";
+  
+  String output;
+  serializeJson(doc, output);
+  return output;
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("\n🚲 TSE-X Bike Lock Starting...");
+  Serial.println("   Firmware: " FIRMWARE_VERSION);
+  Serial.println("   Supports session restore: YES");
+  
+  // LCD init (Parallel)
+  lcd.begin(16, 2);
+  lcd.setCursor(0, 0);
+  lcd.print("TSE-X Bike Lock");
+  lcd.setCursor(0, 1);
+  lcd.print("Initializing...");
+  
+  // Servo
+  lockServo.attach(servoPin, 500, 2400);
+  lockServo.write(0);
+  
+  // Buzzer
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(buzzerPin, LOW);
+  
+  // LEDs
+  pinMode(redLedPin, OUTPUT);
+  pinMode(greenLedPin, OUTPUT);
+  digitalWrite(redLedPin, HIGH);
+  digitalWrite(greenLedPin, LOW);
+  
+  // BLE
+  Serial.println("📶 Initializing BLE...");
+  BLEDevice::init(DEVICE_NAME);
+  
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+  
+  BLEService* pService = pServer->createService(SERVICE_UUID);
+  
+  pDeviceInfoChar = pService->createCharacteristic(
+    DEVICE_INFO_UUID,
+    BLECharacteristic::PROPERTY_READ
+  );
+  pDeviceInfoChar->setValue(buildDeviceInfoJson().c_str());
+  
+  pLockControlChar = pService->createCharacteristic(
+    LOCK_CONTROL_UUID,
+    BLECharacteristic::PROPERTY_WRITE
+  );
+  pLockControlChar->setCallbacks(new LockControlCallbacks());
+  
+  pSessionStatusChar = pService->createCharacteristic(
+    SESSION_STATUS_UUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pSessionStatusChar->addDescriptor(new BLE2902());
+  
+  pService->start();
+  
+  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->start();
+  
+  Serial.println("✅ BLE Ready!");
+  
+  setLocked(true);
+  
+  playBeep(1000, 100);
+  delay(100);
+  playBeep(1200, 100);
+  delay(100);
+  playBeep(1400, 100);
+  
+  Serial.println("🚲 Bike Lock Ready!");
+}
+
+// ==================== LOOP ====================
+void loop() {
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(500);
+    pServer->startAdvertising();
+    oldDeviceConnected = deviceConnected;
+  }
+  
+  if (deviceConnected && !oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+  }
+  
+  updateCountdownDisplay();
+  
+  static unsigned long lastStatusUpdate = 0;
+  if (deviceConnected && isUnlocked && (millis() - lastStatusUpdate > 5000)) {
+    lastStatusUpdate = millis();
+    updateSessionStatus();
+  }
+  
+  delay(50);
 }
