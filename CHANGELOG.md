@@ -1,45 +1,99 @@
 # Changelog
 
-All notable changes to TSE-X402 Arduino Library will be documented in this file.
+All notable changes to the TSE-X Arduino Library.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [1.3.0] - 2026-01-13
+
+### 🔧 Memory Optimization - BikeLock
+**Fixes LCD screen corruption after ~20 minutes of operation**
+
+#### Changed
+- Replaced `String` objects with fixed `char[]` buffers to prevent heap fragmentation
+- `updateSessionStatus()` now uses pre-allocated `jsonOutputBuffer[512]`
+- `buildDeviceInfoJson()` now uses static `deviceInfoBuffer[1024]`
+- Function signatures changed from `String` to `const char*`:
+  - `startSession(duration, txHash, wallet, currency)`
+  - `restoreSession(remainingMs, wallet, currency, txHash)`
+  - `extendSession(extraMs, txHash)`
+- String comparisons changed from `==` to `strcmp()`
+
+#### Added
+- `#include <cstring>` for `strcmp`, `strlen`, `strncpy`
+- Fixed buffers for session data:
+  - `currentTxHash[72]`
+  - `payerWallet[48]`
+  - `paymentCurrency[8]`
+  - `jsonOutputBuffer[512]`
+
+#### Technical Details
+The LCD corruption was caused by heap fragmentation from repeated `String` allocations in `updateSessionStatus()`, which runs every 5 seconds. After ~240 cycles (~20 minutes), fragmented memory would corrupt the LCD buffer. Fixed buffers eliminate all heap allocation during normal operation.
+
+---
+
+## [1.2.0] - 2026-01-12
+
+### 🔐 Device Secret Support - BikeLock
+
+#### Added
+- `DEVICE_SECRET` configuration for claimed devices
+- Device secret transmitted via BLE in `buildDeviceInfoJson()`
+- Clear "USER CONFIGURATION SECTION" at top of file
+- Visual box formatting for easy identification
+
+#### Changed
+- Configuration section reorganized for clarity
+- Firmware version tracking
+
+---
+
+## [1.1.0] - 2026-01-11
+
+### 🔄 Session Restore - BikeLock
+
+#### Added
+- `restoreSession()` function for power loss recovery
+- `setUnlockedQuiet()` for silent unlock on restore
+- `playRestoreSound()` distinct audio feedback
+- `supportsRestore: true` capability flag
+
+#### Changed
+- Session state preserved across app disconnects
+- Timer continues running when phone disconnects
+
+---
 
 ## [1.0.0] - 2026-01-10
 
-### Added
-- Initial release
-- Support for TSE (Solana) payments
-- Support for USDC (Base) payments
-- Device types: Coffee Machine, Bike Lock, Door Lock, Power Switch
-- WiFi connectivity for MKR WiFi 1010 and Arduino Giga R1
-- BLE support for Bike Lock (via mobile app bridge)
-- Memory-optimized buffers to prevent heap fragmentation
-- Automatic session management with timeout
-- Backend polling with configurable intervals
-- Utility functions for parsing JSON responses
-- Example sketches for all device types
+### 🎉 Initial Release
 
-### Device Examples
-- `CoffeeMachine` - Arduino Giga R1 WiFi with touchscreen
-- `BikeLock` - Arduino Nano 33 BLE
-- `DoorLock` - Arduino MKR WiFi 1010
-- `PowerSwitch` - Arduino MKR WiFi 1010 with time-based pricing
+#### CoffeeMachine
+- Arduino Giga R1 WiFi support
+- Touchscreen UI with brew selection
+- Hot Brew and Over Ice options
+- Memory-optimized with fixed buffers
+- Background polling thread (16KB stack)
+- WiFi auto-reconnection
+
+#### BikeLock
+- Arduino Nano 33 BLE support
+- BLE communication with app bridge
+- Servo lock control
+- LCD countdown display
+- Warning sounds at 1 min, 30 sec, 10 sec
+
+#### DoorLock (Coming Soon)
+- Arduino MKR WiFi 1010 placeholder
+
+#### PowerSwitch (Coming Soon)
+- Arduino MKR WiFi 1010 placeholder
 
 ---
 
 ## Version History
 
-| Version | Date | Description |
-|---------|------|-------------|
-| 1.0.0 | 2026-01-10 | Initial public release |
-
----
-
-## Upcoming Features
-
-- [ ] EV Charger support
-- [ ] ESP32 support
-- [ ] Local caching for offline operation
-- [ ] OTA updates
-- [ ] Multi-relay support for Power Switch
+| Version | Date | Highlights |
+|---------|------|------------|
+| 1.3.0 | 2026-01-13 | Memory optimization, LCD fix |
+| 1.2.0 | 2026-01-12 | Device secret support |
+| 1.1.0 | 2026-01-11 | Session restore |
+| 1.0.0 | 2026-01-10 | Initial release |
