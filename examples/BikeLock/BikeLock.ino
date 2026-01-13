@@ -5,6 +5,7 @@
 #include <ESP32Servo.h>
 #include <LiquidCrystal.h>
 #include <ArduinoJson.h>
+#include <cstring>  // For strcmp, strlen, strncpy
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║                    🔧 USER CONFIGURATION SECTION 🔧                       ║
@@ -30,7 +31,7 @@
 
 #define DEVICE_TYPE      "Bike Lock"
 #define DEVICE_MODEL     "BL-100"
-#define FIRMWARE_VERSION "1.2.0"  // Updated for device secret support
+#define FIRMWARE_VERSION "1.3.0"  // Memory-optimized: fixed buffers, no String fragmentation
 
 // ==================== BLE UUIDs (do not change) ====================
 #define SERVICE_UUID           "b3c8f420-0000-4020-8000-000000000000"
@@ -65,9 +66,13 @@ bool isUnlocked = false;
 unsigned long sessionDurationMs = 0;
 unsigned long sessionStartMillis = 0;
 long lastDisplaySeconds = -1;
-String currentTxHash = "";
-String payerWallet = "";
-String paymentCurrency = "";
+
+// ============ MEMORY-SAFE FIXED BUFFERS ============
+// Avoid String objects to prevent heap fragmentation
+char currentTxHash[72] = "";      // Solana tx hashes are ~88 chars, but we truncate
+char payerWallet[48] = "";        // Wallet addresses
+char paymentCurrency[8] = "";     // "TSE" or "USDC"
+char jsonOutputBuffer[512];       // Reusable buffer for JSON serialization
 
 // ==================== BUZZER FUNCTIONS ====================
 void playBeep(int freq, int durationMs) {
@@ -139,9 +144,9 @@ void setLocked(bool locked) {
     
     sessionDurationMs = 0;
     sessionStartMillis = 0;
-    currentTxHash = "";
-    payerWallet = "";
-    paymentCurrency = "";
+    currentTxHash[0] = '\0';
+    payerWallet[0] = '\0';
+    paymentCurrency[0] = '\0';
     lastDisplaySeconds = -1;
     
     lcd.clear();
@@ -187,7 +192,7 @@ void setUnlockedQuiet() {
   lcd.print("Time: --:--");
 }
 
-void startSession(unsigned long durationMs, String txHash, String wallet, String currency) {
+void startSession(unsigned long durationMs, const char* txHash, const char* wallet, const char* currency) {
   Serial.println("▶️ ============ STARTING SESSION ============");
   Serial.print("   Duration: ");
   Serial.print(durationMs / 1000);
@@ -201,16 +206,19 @@ void startSession(unsigned long durationMs, String txHash, String wallet, String
   
   sessionDurationMs = durationMs;
   sessionStartMillis = millis();
-  currentTxHash = txHash;
-  payerWallet = wallet;
-  paymentCurrency = currency;
+  strncpy(currentTxHash, txHash, sizeof(currentTxHash) - 1);
+  currentTxHash[sizeof(currentTxHash) - 1] = '\0';
+  strncpy(payerWallet, wallet, sizeof(payerWallet) - 1);
+  payerWallet[sizeof(payerWallet) - 1] = '\0';
+  strncpy(paymentCurrency, currency, sizeof(paymentCurrency) - 1);
+  paymentCurrency[sizeof(paymentCurrency) - 1] = '\0';
   lastDisplaySeconds = -1;
   
   setLocked(false);
   Serial.println("▶️ Session started successfully!");
 }
 
-void restoreSession(unsigned long remainingMs, String wallet, String currency, String txHash) {
+void restoreSession(unsigned long remainingMs, const char* wallet, const char* currency, const char* txHash) {
   Serial.println("🔄 ============ RESTORING SESSION ============");
   Serial.print("   Remaining: ");
   Serial.print(remainingMs / 1000);
@@ -224,9 +232,16 @@ void restoreSession(unsigned long remainingMs, String wallet, String currency, S
   
   sessionDurationMs = remainingMs;
   sessionStartMillis = millis();
-  currentTxHash = txHash.length() > 0 ? txHash : "restored";
-  payerWallet = wallet;
-  paymentCurrency = currency;
+  if (txHash && strlen(txHash) > 0) {
+    strncpy(currentTxHash, txHash, sizeof(currentTxHash) - 1);
+  } else {
+    strncpy(currentTxHash, "restored", sizeof(currentTxHash) - 1);
+  }
+  currentTxHash[sizeof(currentTxHash) - 1] = '\0';
+  strncpy(payerWallet, wallet, sizeof(payerWallet) - 1);
+  payerWallet[sizeof(payerWallet) - 1] = '\0';
+  strncpy(paymentCurrency, currency, sizeof(paymentCurrency) - 1);
+  paymentCurrency[sizeof(paymentCurrency) - 1] = '\0';
   lastDisplaySeconds = -1;
   
   setUnlockedQuiet();
@@ -248,11 +263,12 @@ void endSession() {
   Serial.println("⏹️ Session ended!");
 }
 
-void extendSession(unsigned long extraMs, String txHash) {
+void extendSession(unsigned long extraMs, const char* txHash) {
   if (!isUnlocked) return;
   
   sessionDurationMs += extraMs;
-  currentTxHash = txHash;
+  strncpy(currentTxHash, txHash, sizeof(currentTxHash) - 1);
+  currentTxHash[sizeof(currentTxHash) - 1] = '\0';
   
   lcd.setCursor(0, 0);
   lcd.print("TIME EXTENDED!  ");
@@ -289,10 +305,9 @@ void updateSessionStatus() {
     doc["remainingMs"] = 0;
   }
   
-  String output;
-  serializeJson(doc, output);
-  
-  pSessionStatusChar->setValue(output.c_str());
+  // Use pre-allocated buffer instead of String to prevent heap fragmentation
+  serializeJson(doc, jsonOutputBuffer, sizeof(jsonOutputBuffer));
+  pSessionStatusChar->setValue(jsonOutputBuffer);
 }
 
 // ==================== LCD COUNTDOWN ====================
@@ -392,12 +407,13 @@ class ServerCallbacks : public BLEServerCallbacks {
 
 class LockControlCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pCharacteristic) {
-    String value = pCharacteristic->getValue().c_str();
+    // Use getValue() directly - it returns std::string which we can use with c_str()
+    std::string valueStr = pCharacteristic->getValue();
     Serial.print("📥 Received command: ");
-    Serial.println(value);
+    Serial.println(valueStr.c_str());
     
     StaticJsonDocument<512> doc;
-    DeserializationError error = deserializeJson(doc, value);
+    DeserializationError error = deserializeJson(doc, valueStr.c_str());
     
     if (error) {
       Serial.print("❌ JSON parse error: ");
@@ -406,15 +422,15 @@ class LockControlCallbacks : public BLECharacteristicCallbacks {
       return;
     }
     
-    String action = doc["action"] | "";
+    const char* action = doc["action"] | "";
     
-    if (action == "unlock") {
-      String txHash = doc["txHash"] | "";
-      String wallet = doc["wallet"] | "";
-      String currency = doc["currency"] | "TSE";
+    if (strcmp(action, "unlock") == 0) {
+      const char* txHash = doc["txHash"] | "";
+      const char* wallet = doc["wallet"] | "";
+      const char* currency = doc["currency"] | "TSE";
       unsigned long duration = doc["durationMs"] | 1800000;
       
-      if (txHash.length() > 0) {
+      if (strlen(txHash) > 0) {
         Serial.println("✅ Payment verified, unlocking...");
         startSession(duration, txHash, wallet, currency);
       } else {
@@ -435,10 +451,10 @@ class LockControlCallbacks : public BLECharacteristicCallbacks {
         }
       }
     }
-    else if (action == "restore") {
-      String wallet = doc["wallet"] | "";
-      String currency = doc["currency"] | "TSE";
-      String txHash = doc["txHash"] | "restored";
+    else if (strcmp(action, "restore") == 0) {
+      const char* wallet = doc["wallet"] | "";
+      const char* currency = doc["currency"] | "TSE";
+      const char* txHash = doc["txHash"] | "restored";
       unsigned long remainingMs = doc["remainingMs"] | 0;
       
       Serial.println("🔄 ============ RESTORE COMMAND RECEIVED ============");
@@ -448,7 +464,7 @@ class LockControlCallbacks : public BLECharacteristicCallbacks {
       Serial.print(remainingMs / 1000);
       Serial.println(" seconds");
       
-      if (remainingMs > 0 && wallet.length() > 0) {
+      if (remainingMs > 0 && strlen(wallet) > 0) {
         if (isUnlocked) {
           Serial.println("⚠️ Already unlocked - ignoring restore");
           playErrorSound();
@@ -472,7 +488,7 @@ class LockControlCallbacks : public BLECharacteristicCallbacks {
         lcd.print("Scan to unlock");
       }
     }
-    else if (action == "lock" || action == "end") {
+    else if (strcmp(action, "lock") == 0 || strcmp(action, "end") == 0) {
       Serial.println("🔒 ============ LOCK COMMAND RECEIVED ============");
       Serial.print("   Currently unlocked: ");
       Serial.println(isUnlocked ? "YES" : "NO");
@@ -489,17 +505,17 @@ class LockControlCallbacks : public BLECharacteristicCallbacks {
         Serial.println("   Already locked, ignoring.");
       }
     }
-    else if (action == "extend") {
+    else if (strcmp(action, "extend") == 0) {
       unsigned long extraMs = doc["extraMs"] | 0;
-      String txHash = doc["txHash"] | "";
+      const char* txHash = doc["txHash"] | "";
       
-      if (isUnlocked && extraMs > 0 && txHash.length() > 0) {
+      if (isUnlocked && extraMs > 0 && strlen(txHash) > 0) {
         extendSession(extraMs, txHash);
       } else {
         playErrorSound();
       }
     }
-    else if (action == "status") {
+    else if (strcmp(action, "status") == 0) {
       updateSessionStatus();
     }
   }
@@ -507,7 +523,10 @@ class LockControlCallbacks : public BLECharacteristicCallbacks {
 
 // ==================== BUILD DEVICE INFO ====================
 // This JSON is sent to the app when it connects via BLE
-String buildDeviceInfoJson() {
+// Uses a static buffer since device info doesn't change after startup
+static char deviceInfoBuffer[1024];
+
+void buildDeviceInfoJson() {
   StaticJsonDocument<1024> doc;
   
   // Core identity (includes secret for backend authentication)
@@ -542,9 +561,7 @@ String buildDeviceInfoJson() {
   // Current state
   doc["state"] = isUnlocked ? "unlocked" : "locked";
   
-  String output;
-  serializeJson(doc, output);
-  return output;
+  serializeJson(doc, deviceInfoBuffer, sizeof(deviceInfoBuffer));
 }
 
 // ==================== SETUP ====================
@@ -591,7 +608,8 @@ void setup() {
     DEVICE_INFO_UUID,
     BLECharacteristic::PROPERTY_READ
   );
-  pDeviceInfoChar->setValue(buildDeviceInfoJson().c_str());
+  buildDeviceInfoJson();  // Populate deviceInfoBuffer
+  pDeviceInfoChar->setValue(deviceInfoBuffer);
   
   pLockControlChar = pService->createCharacteristic(
     LOCK_CONTROL_UUID,
