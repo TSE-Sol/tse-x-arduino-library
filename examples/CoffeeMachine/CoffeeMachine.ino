@@ -19,7 +19,7 @@ const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
 const char* BACKEND_HOST = "tse-x-backend.onrender.com";
 const int BACKEND_PORT = 443;
-const char* DEVICE_ID = "YOUR_DEVICE_ID";
+const char* DEVICE_ID = "X402-COFFEE-001";
 
 // Device Secret - Get this from the app's Device Creator
 // Leave as empty string "" to run as unclaimed device
@@ -972,10 +972,18 @@ void backgroundPollTask() {
     // IMPORTANT: Skip HTTP headers before reading body
     bgHttp.skipResponseHeaders();
     
-    // Read response BODY into fixed buffer
+    // Read response BODY into fixed buffer (with proper waiting)
     int responseLen = 0;
-    while (bgHttp.available() && responseLen < (int)sizeof(bgResponseBuffer) - 1) {
-      bgResponseBuffer[responseLen++] = bgHttp.read();
+    unsigned long readTimeout = millis() + 3000;  // 3 second timeout
+    while (millis() < readTimeout && responseLen < (int)sizeof(bgResponseBuffer) - 1) {
+      if (bgHttp.available()) {
+        bgResponseBuffer[responseLen++] = bgHttp.read();
+        readTimeout = millis() + 500;  // Reset timeout on data received
+      } else if (!bgHttp.connected()) {
+        break;  // Server closed connection
+      } else {
+        delay(5);  // Wait for more data
+      }
     }
     bgResponseBuffer[responseLen] = '\0';
     
@@ -1098,10 +1106,18 @@ void pollPaymentStatus() {
   // IMPORTANT: Skip HTTP headers before reading body
   httpClient->skipResponseHeaders();
   
-  // Read response BODY into fixed buffer
+  // Read response BODY into fixed buffer (with proper waiting)
   int responseLen = 0;
-  while (httpClient->available() && responseLen < (int)sizeof(httpResponseBuffer) - 1) {
-    httpResponseBuffer[responseLen++] = httpClient->read();
+  unsigned long readTimeout = millis() + 3000;  // 3 second timeout
+  while (millis() < readTimeout && responseLen < (int)sizeof(httpResponseBuffer) - 1) {
+    if (httpClient->available()) {
+      httpResponseBuffer[responseLen++] = httpClient->read();
+      readTimeout = millis() + 500;  // Reset timeout on data received
+    } else if (!httpClient->connected()) {
+      break;  // Server closed connection
+    } else {
+      delay(5);  // Wait for more data
+    }
   }
   httpResponseBuffer[responseLen] = '\0';
   
@@ -1230,8 +1246,8 @@ void initBLE() {
     "\"model\":\"X402-CF Pro\","
     "\"firmwareVersion\":\"1.0.0\","
     "\"chains\":["
-      "{\"chain\":\"solana\",\"wallet\":\"YOUR_SOLANA_WALLET_ADDRESS\"},"
-      "{\"chain\":\"base\",\"wallet\":\"YOUR_BASE_WALLET_ADDRESS\"}"
+      "{\"chain\":\"solana\",\"wallet\":\"E7gnXdN4Nneh5KHBUgXVdUNXkBYtwNF4fkpzZU3otnmX\"},"
+      "{\"chain\":\"base\",\"wallet\":\"0x8469a3A136AE586356bAA89C61191D8E2d84B92f\"}"
     "]}";
   
   deviceInfoChar.writeValue(bleDeviceInfo.c_str());
