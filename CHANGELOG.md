@@ -2,6 +2,46 @@
 
 All notable changes to the TSE-X Arduino Library.
 
+## [1.4.0] - 2026-01-30
+
+### 🔧 HTTP Response Fix - CoffeeMachine
+**Fixes intermittent start/stop behavior during brewing**
+
+#### Fixed
+- HTTP response truncation causing incomplete JSON parsing
+- Arduino would receive only 24-26 bytes instead of full ~800 byte response
+- This caused `brewing: true` field to be missed, triggering session end
+
+#### Changed
+- HTTP response reading now waits properly for all data to arrive
+- Added timeout-based reading with 500ms extension on each byte received
+- Applied fix to both main thread and background polling thread
+
+#### Technical Details
+The original code used `while (httpClient->available())` which exits immediately when the TCP buffer is empty, even if more data is still in transit. The fix adds a rolling timeout that waits up to 3 seconds total, extending 500ms each time data is received.
+
+```cpp
+// Old (broken)
+while (httpClient->available()) {
+  buffer[len++] = httpClient->read();
+}
+
+// New (fixed)
+unsigned long readTimeout = millis() + 3000;
+while (millis() < readTimeout && len < bufferSize - 1) {
+  if (httpClient->available()) {
+    buffer[len++] = httpClient->read();
+    readTimeout = millis() + 500;  // Reset timeout on data
+  } else if (!httpClient->connected()) {
+    break;
+  } else {
+    delay(5);
+  }
+}
+```
+
+---
+
 ## [1.3.0] - 2026-01-13
 
 ### 🔧 Memory Optimization - BikeLock
@@ -93,6 +133,7 @@ The LCD corruption was caused by heap fragmentation from repeated `String` alloc
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| 1.4.0 | 2026-01-30 | HTTP response truncation fix |
 | 1.3.0 | 2026-01-13 | Memory optimization, LCD fix |
 | 1.2.0 | 2026-01-12 | Device secret support |
 | 1.1.0 | 2026-01-11 | Session restore |
