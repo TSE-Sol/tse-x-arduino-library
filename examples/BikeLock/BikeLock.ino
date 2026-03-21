@@ -30,8 +30,8 @@
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 #define DEVICE_TYPE      "Bike Lock"
-#define DEVICE_MODEL     "BL-100"
-#define FIRMWARE_VERSION "1.3.0"  // Memory-optimized: fixed buffers, no String fragmentation
+#define DEVICE_MODEL     "YOUR_DEVICE_MODEL"
+#define FIRMWARE_VERSION "YOUR_FIRMWARE_VERSION"  // Memory-optimized: fixed buffers, no String fragmentation
 
 // ==================== BLE UUIDs (do not change) ====================
 #define SERVICE_UUID           "b3c8f420-0000-4020-8000-000000000000"
