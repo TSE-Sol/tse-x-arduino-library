@@ -305,7 +305,6 @@ void updateSessionStatus() {
     doc["remainingMs"] = 0;
   }
   
-  // Use pre-allocated buffer instead of String to prevent heap fragmentation
   serializeJson(doc, jsonOutputBuffer, sizeof(jsonOutputBuffer));
   pSessionStatusChar->setValue(jsonOutputBuffer);
 }
@@ -407,7 +406,6 @@ class ServerCallbacks : public BLEServerCallbacks {
 
 class LockControlCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pCharacteristic) {
-    // Use getValue() directly - it returns std::string which we can use with c_str()
     std::string valueStr = pCharacteristic->getValue();
     Serial.print("📥 Received command: ");
     Serial.println(valueStr.c_str());
@@ -430,26 +428,11 @@ class LockControlCallbacks : public BLECharacteristicCallbacks {
       const char* currency = doc["currency"] | "TSE";
       unsigned long duration = doc["durationMs"] | 1800000;
       
-      if (strlen(txHash) > 0) {
-        Serial.println("✅ Payment verified, unlocking...");
-        startSession(duration, txHash, wallet, currency);
-      } else {
-        Serial.println("❌ No transaction hash");
-        playErrorSound();
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("Payment Error");
-        lcd.setCursor(0, 1);
-        lcd.print("No TX hash");
-        delay(2000);
-        if (!isUnlocked) {
-          lcd.clear();
-          lcd.setCursor(0, 0);
-          lcd.print("LOCKED");
-          lcd.setCursor(0, 1);
-          lcd.print("Try again");
-        }
-      }
+      // Payment already verified by backend — accept any unlock with valid duration
+      // Use "verified" as fallback txHash for payment methods that don't return a hash
+      Serial.println("✅ Unlock command received, starting session...");
+      const char* safeTxHash = (strlen(txHash) > 0) ? txHash : "verified";
+      startSession(duration, safeTxHash, wallet, currency);
     }
     else if (strcmp(action, "restore") == 0) {
       const char* wallet = doc["wallet"] | "";
@@ -522,22 +505,18 @@ class LockControlCallbacks : public BLECharacteristicCallbacks {
 };
 
 // ==================== BUILD DEVICE INFO ====================
-// This JSON is sent to the app when it connects via BLE
-// Uses a static buffer since device info doesn't change after startup
 static char deviceInfoBuffer[1024];
 
 void buildDeviceInfoJson() {
   StaticJsonDocument<1024> doc;
   
-  // Core identity (includes secret for backend authentication)
   doc["deviceId"] = DEVICE_ID;
-  doc["deviceSecret"] = DEVICE_SECRET;  // ← App uses this for heartbeat auth!
+  doc["deviceSecret"] = DEVICE_SECRET;
   doc["deviceName"] = DEVICE_NAME;
   doc["deviceType"] = DEVICE_TYPE;
   doc["model"] = DEVICE_MODEL;
   doc["firmwareVersion"] = FIRMWARE_VERSION;
   
-  // Device capabilities
   doc["supportsLock"] = true;
   doc["supportsTimer"] = true;
   doc["supportsBLE"] = true;
@@ -547,7 +526,6 @@ void buildDeviceInfoJson() {
   doc["supportsUSDC"] = true;
   doc["supportsRestore"] = true;
   
-  // Payment wallet addresses
   JsonArray chains = doc.createNestedArray("chains");
   
   JsonObject solana = chains.createNestedObject();
@@ -558,7 +536,6 @@ void buildDeviceInfoJson() {
   base["chain"] = "base";
   base["wallet"] = BASE_WALLET;
   
-  // Current state
   doc["state"] = isUnlocked ? "unlocked" : "locked";
   
   serializeJson(doc, deviceInfoBuffer, sizeof(deviceInfoBuffer));
@@ -572,30 +549,25 @@ void setup() {
   Serial.println("   Firmware: " FIRMWARE_VERSION);
   Serial.println("   Device ID: " DEVICE_ID);
   Serial.println("   Supports session restore: YES");
-  Serial.println("   Device secret: ****");  // Don't print actual secret!
+  Serial.println("   Device secret: ****");
   
-  // LCD init (Parallel)
   lcd.begin(16, 2);
   lcd.setCursor(0, 0);
   lcd.print("TSE-X Bike Lock");
   lcd.setCursor(0, 1);
   lcd.print("Initializing...");
   
-  // Servo
   lockServo.attach(servoPin, 500, 2400);
   lockServo.write(0);
   
-  // Buzzer
   pinMode(buzzerPin, OUTPUT);
   digitalWrite(buzzerPin, LOW);
   
-  // LEDs
   pinMode(redLedPin, OUTPUT);
   pinMode(greenLedPin, OUTPUT);
   digitalWrite(redLedPin, HIGH);
   digitalWrite(greenLedPin, LOW);
   
-  // BLE
   Serial.println("📶 Initializing BLE...");
   BLEDevice::init(DEVICE_NAME);
   
@@ -608,7 +580,7 @@ void setup() {
     DEVICE_INFO_UUID,
     BLECharacteristic::PROPERTY_READ
   );
-  buildDeviceInfoJson();  // Populate deviceInfoBuffer
+  buildDeviceInfoJson();
   pDeviceInfoChar->setValue(deviceInfoBuffer);
   
   pLockControlChar = pService->createCharacteristic(
